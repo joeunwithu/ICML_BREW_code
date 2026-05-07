@@ -1,4 +1,4 @@
-# NIPS_BREW
+# ICML_BREW
 
 ## 1. Environment
 
