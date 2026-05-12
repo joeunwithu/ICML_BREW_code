@@ -1,5 +1,8 @@
 # ICML_BREW
 
+This repository provides a lightweight reference implementation of BREW for understanding the main algorithmic components.
+The released code is intended as an illustrative implementation rather than an exact reproduction package for all experiments reported in the paper. For simplicity and readability, some engineering details are simplified.
+
 ## 1. Environment
 
 ```bash
