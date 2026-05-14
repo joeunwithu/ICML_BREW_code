@@ -44,7 +44,7 @@ class BREWUtils:
 
         self.F = GF(2)
         self.n = 2**self.config.bch_m - 1
-        self.d = 15
+        self.d = 2 * self.config.bch_t + 1
         self.C = codes.BCHCode(self.F, self.n, self.d)
         self.k = self.C.dimension()
 
