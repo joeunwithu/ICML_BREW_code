@@ -8,6 +8,7 @@ from utils.utils import load_config_file
 from utils.transformers_config import TransformersConfig
 from transformers import LogitsProcessor, LogitsProcessorList
 import random
+import hashlib
 
 
 class BREWConfig(BaseConfig):
@@ -33,11 +34,13 @@ class BREWConfig(BaseConfig):
 class BREWUtils:
     def __init__(self, config):
         self.config = config
-        self.rng = torch.Generator(device=self.config.device)
-        self.rng.manual_seed(self.config.hash_key)
 
         self.vocab_size = config.vocab_size
-        self.green_mask = self._init_fixed_vocab_split()
+        self.allowed_token_ids = torch.arange(self.vocab_size, device=self.config.device)
+
+        # block_index -> (green_mask_cpu, green_ids, red_ids)
+        # This implements block-specific partitioning with seed_j = H(K, j).
+        self._partition_cache = {}
 
         self.F = GF(2)
         self.n = 2**self.config.bch_m - 1
@@ -47,26 +50,76 @@ class BREWUtils:
 
         self.codeword_pair = self._find_distant_codeword_pair()
 
-    def _init_fixed_vocab_split(self):
-        self.allowed_token_ids = torch.arange(self.vocab_size, device=self.config.device)
-        perm = torch.randperm(self.vocab_size, device=self.config.device, generator=self.rng)
-        green_ids = self.allowed_token_ids[perm[: self.vocab_size // 2]]
-        red_ids = self.allowed_token_ids[perm[self.vocab_size // 2:]]
+    def _seed_for_block(self, block_index: int) -> int:
+        """
+        Derive seed_j = H(K, j) deterministically from the secret key K
+        and block index j.
+        """
+        key = str(self.config.hash_key).encode("utf-8")
+        msg = str(block_index).encode("utf-8")
+        digest = hashlib.sha256(key + b":" + msg).digest()
 
-        mask = torch.zeros(self.vocab_size, dtype=torch.bool)
-        mask[green_ids.cpu()] = True
-        self._red_ids = red_ids.tolist()
-        self._green_ids = green_ids.tolist()
-        return mask
+        # Use 63 bits to stay safely within torch manual_seed range.
+        return int.from_bytes(digest[:8], byteorder="big") & ((1 << 63) - 1)
 
-    def get_greenlist_ids(self):
-        return self._green_ids
+    def _init_vocab_split_for_block(self, block_index: int):
+        """
+        Generate a block-specific green/red vocabulary partition using
+        seed_j = H(K, j).
+        """
+        if block_index in self._partition_cache:
+            return self._partition_cache[block_index]
 
-    def get_redlist_ids(self):
-        return self._red_ids
+        seed_j = self._seed_for_block(block_index)
+
+        rng_j = torch.Generator(device=self.config.device)
+        rng_j.manual_seed(seed_j)
+
+        perm = torch.randperm(
+            self.vocab_size,
+            device=self.config.device,
+            generator=rng_j
+        )
+
+        green_ids_t = self.allowed_token_ids[perm[: self.vocab_size // 2]]
+        red_ids_t = self.allowed_token_ids[perm[self.vocab_size // 2:]]
+
+        green_mask = torch.zeros(self.vocab_size, dtype=torch.bool)
+        green_mask[green_ids_t.cpu()] = True
+
+        green_ids = green_ids_t.tolist()
+        red_ids = red_ids_t.tolist()
+
+        self._partition_cache[block_index] = (green_mask, green_ids, red_ids)
+        return self._partition_cache[block_index]
+
+    def get_greenlist_ids(self, block_index: int):
+        _, green_ids, _ = self._init_vocab_split_for_block(block_index)
+        return green_ids
+
+    def get_redlist_ids(self, block_index: int):
+        _, _, red_ids = self._init_vocab_split_for_block(block_index)
+        return red_ids
 
     def get_allowed_token_ids(self):
         return self.allowed_token_ids.tolist()
+
+    def get_green_mask(self, block_index: int, device=None):
+        green_mask, _, _ = self._init_vocab_split_for_block(block_index)
+        return green_mask if device is None else green_mask.to(device)
+
+    def tokens_to_bits_for_block(self, token_ids: torch.Tensor, block_index: int) -> torch.Tensor:
+        """
+        Convert tokens in the j-th block into bits using the j-specific
+        vocabulary partition.
+        """
+        vocab_sz = self.vocab_size
+        gm = self.get_green_mask(block_index, device=token_ids.device)
+        valid = token_ids < vocab_sz
+
+        bits = torch.zeros_like(token_ids, dtype=torch.int8)
+        bits[valid] = gm[token_ids[valid]].to(torch.int8)
+        return bits
 
     def _encode_message(self, message_bits: list[int]) -> list[int]:
         m = vector(self.F, message_bits)
@@ -108,18 +161,6 @@ class BREWUtils:
     def sample_message_and_codeword(self):
         return random.choice(self.codeword_pair)
 
-    def get_green_mask(self, device=None):
-        return self.green_mask if device is None else self.green_mask.to(device)
-
-    def tokens_to_bits(self, token_ids: torch.Tensor) -> torch.Tensor:
-        vocab_sz = self.vocab_size
-        gm = self.green_mask.to(token_ids.device)
-        valid = token_ids < vocab_sz
-
-        bits = torch.zeros_like(token_ids, dtype=torch.int8)
-        bits[valid] = gm[token_ids[valid]].to(torch.int8)
-        return bits
-
 
 class BREWLogitsProcessor(LogitsProcessor):
     def __init__(self, config, utils):
@@ -138,10 +179,20 @@ class BREWLogitsProcessor(LogitsProcessor):
 
         return self.codeword_queue[codeword_index][bit_index]
 
-    def _get_target_token_ids(self, bit: int, input_ids: torch.LongTensor) -> list[int]:
+    def _get_target_token_ids(
+        self,
+        bit: int,
+        block_index: int,
+        input_ids: torch.LongTensor
+    ) -> list[int]:
         allowed = set(self.utils.get_allowed_token_ids())
 
-        target_ids = self.utils.get_greenlist_ids() if bit == 1 else self.utils.get_redlist_ids()
+        target_ids = (
+            self.utils.get_greenlist_ids(block_index)
+            if bit == 1
+            else self.utils.get_redlist_ids(block_index)
+        )
+
         return list(set(target_ids) & allowed)
 
     def _get_bias_mask(self, scores: torch.Tensor, target_ids: list[int]) -> torch.BoolTensor:
@@ -165,10 +216,12 @@ class BREWLogitsProcessor(LogitsProcessor):
 
         for b in range(scores.shape[0]):
             token_position = len(self.token_bit_log)
+            block_index = token_position // self.utils.n
+
             bit = self._get_codeword_bit(token_position)
             self.token_bit_log.append(bit)
 
-            target_ids = self._get_target_token_ids(bit, input_ids[b])
+            target_ids = self._get_target_token_ids(bit, block_index, input_ids[b])
             mask = self._get_bias_mask(scores[b], target_ids)
 
             if self.config.scheme == 'hard':
@@ -198,7 +251,7 @@ class BREW(BaseWatermark):
     def cyclic_shift(bits: list[int], shift: int, direction: str = 'left') -> list[int]:
         """
         Kept for compatibility, but no longer used for insertion/deletion detection.
-        The detector below uses global linear offsets on the full bitstream.
+        The detector below uses global linear offsets on the full token stream.
         """
         if direction == 'left':
             return bits[shift:] + bits[:shift]
@@ -208,39 +261,33 @@ class BREW(BaseWatermark):
             raise ValueError(f"Invalid shift direction: {direction}")
 
     @staticmethod
-    def make_blocks_with_global_offset(
-        bit_stream: list[int],
+    def make_token_blocks_with_global_offset(
+        token_stream: list[int],
         start_idx: int,
         n: int,
         max_blocks: int,
         offset: int,
     ) -> list[list[int]]:
         """
-        Apply one global linear offset to the whole bitstream, then split it
-        into n-bit blocks.
+        Apply one global linear offset to the whole token stream, then split it
+        into n-token blocks.
 
-        This implements:
-
-            for s in range(-s_max, s_max + 1):
-                bitstream = extract_bitstream(tokens, offset=s)
-                for j in range(M):
-                    block = bitstream[j*n:(j+1)*n]
-
-        Unlike cyclic_shift(), this does not rotate bits inside each block.
+        For each block j, tokens are later converted to bits using the
+        j-specific vocabulary partition generated by seed_j = H(K, j).
         """
         offset_start = start_idx + offset
 
         if offset_start < 0:
             return []
 
-        available = len(bit_stream) - offset_start
+        available = len(token_stream) - offset_start
         if available < n:
             return []
 
         num_blocks = min(max_blocks, available // n)
 
         return [
-            bit_stream[offset_start + j * n : offset_start + (j + 1) * n]
+            token_stream[offset_start + j * n : offset_start + (j + 1) * n]
             for j in range(num_blocks)
         ]
 
@@ -313,8 +360,7 @@ class BREW(BaseWatermark):
             add_special_tokens=False
         )["input_ids"][0].to(device)
 
-        bits_t = self.utils.tokens_to_bits(encoded_text)
-        bit_stream = bits_t.tolist()
+        token_stream = encoded_text.tolist()
 
         prompt_len = detect_prompt_ids.shape[1]
         start_idx = 0 if len(encoded_text) <= (prompt_len - 1) else (prompt_len - 1)
@@ -360,15 +406,15 @@ class BREW(BaseWatermark):
         }
 
         for s in range(-max_shift, max_shift + 1):
-            bit_segments = BREW.make_blocks_with_global_offset(
-                bit_stream=bit_stream,
+            token_segments = BREW.make_token_blocks_with_global_offset(
+                token_stream=token_stream,
                 start_idx=start_idx,
                 n=n,
                 max_blocks=max_blocks,
                 offset=s,
             )
 
-            num_segments = len(bit_segments)
+            num_segments = len(token_segments)
             if num_segments == 0:
                 continue
 
@@ -377,7 +423,14 @@ class BREW(BaseWatermark):
             matched_s = 0
             match_info_s = []
 
-            for j, (seg_bits, gt_bits) in enumerate(zip(bit_segments, gt_list)):
+            for j, (token_block, gt_bits) in enumerate(zip(token_segments, gt_list)):
+                token_block_t = torch.tensor(token_block, dtype=torch.long, device=device)
+
+                seg_bits = self.utils.tokens_to_bits_for_block(
+                    token_block_t,
+                    block_index=j
+                ).tolist()
+
                 raw_errors = hamming(seg_bits, gt_bits)
                 c_hat_bits = _decode_to_code_safe(seg_bits)
 
@@ -465,8 +518,7 @@ class BREW(BaseWatermark):
             add_special_tokens=False
         )["input_ids"][0].to(device)
 
-        bits_t = self.utils.tokens_to_bits(encoded_text)
-        bit_stream = bits_t.tolist()
+        token_stream = encoded_text.tolist()
 
         prompt_len = detect_prompt_ids.shape[1]
         start_idx = 0 if len(encoded_text) <= (prompt_len - 1) else (prompt_len - 1)
@@ -499,15 +551,15 @@ class BREW(BaseWatermark):
         per_offset_summaries = []
 
         for s in range(-max_shift, max_shift + 1):
-            bit_segments = BREW.make_blocks_with_global_offset(
-                bit_stream=bit_stream,
+            token_segments = BREW.make_token_blocks_with_global_offset(
+                token_stream=token_stream,
                 start_idx=start_idx,
                 n=n,
                 max_blocks=max_blocks,
                 offset=s,
             )
 
-            num_segments = len(bit_segments)
+            num_segments = len(token_segments)
             if num_segments == 0:
                 continue
 
@@ -520,7 +572,14 @@ class BREW(BaseWatermark):
             if debug:
                 print(f"\n[Global offset {s}] Checking {num_segments} blocks")
 
-            for j, (seg_bits, gt_bits) in enumerate(zip(bit_segments, gt_list)):
+            for j, (token_block, gt_bits) in enumerate(zip(token_segments, gt_list)):
+                token_block_t = torch.tensor(token_block, dtype=torch.long, device=device)
+
+                seg_bits = self.utils.tokens_to_bits_for_block(
+                    token_block_t,
+                    block_index=j
+                ).tolist()
+
                 raw_errors = hamming(seg_bits, gt_bits)
                 total_errors_s += raw_errors
 
